@@ -1,0 +1,30 @@
+{
+  "name": "other-android-app",
+  "evaluate_path": "/ask",
+  "health_path": "/status",
+  "health_expect": {"ready": true},
+  "request_fields": {
+    "case_id": "requestId",
+    "question": "query",
+    "metadata": null,
+    "top_k": "options.limit",
+    "model_id": null,
+    "retrieval_only": null
+  },
+  "response_fields": {
+    "generated_answer": "result.answer",
+    "retrieved_chunks": "result.documents",
+    "total_latency_ms": "timings.total_ms",
+    "retrieval_timing_ms": "timings.retrieval_ms",
+    "generation_timing_ms": "timings.generation_ms",
+    "runtime": null,
+    "decoding_metrics": null,
+    "error": "error"
+  },
+  "chunk_fields": {
+    "text": "body",
+    "source": "metadata.title",
+    "score": "similarity"
+  },
+  "judge_domain": "general"
+}
