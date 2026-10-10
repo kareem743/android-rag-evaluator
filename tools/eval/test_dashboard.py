@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import dashboard
+from judge import JudgeConfig
 import requests
 import base64
 import json
@@ -104,8 +105,7 @@ def test_dashboard_runs_generic_app_without_android_readiness_or_diagnostics(mon
     dashboard._initialize_run_state("generic", 1, "Queued", "Running")
     dashboard._run_evaluation_job(
         job_id="generic", api_base="http://localhost:9000", llm_model_id=None, top_k=3,
-        use_ollama_judge=False, retrieval_only=False, ollama_base_url="http://localhost:11434",
-        ollama_model="test", cases=[{"case_id": "one", "question": "Question"}], corpus_docs=None,
+        use_judge=False, retrieval_only=False, judge_config=None, cases=[{"case_id": "one", "question": "Question"}], corpus_docs=None,
         total_loaded_cases=1, adapter_kind="generic",
     )
     snapshot = dashboard._snapshot_run_state()
@@ -208,7 +208,7 @@ def test_run_evaluation_job_updates_state_and_logs(monkeypatch, tmp_path):
     monkeypatch.setattr(dashboard, "call_evaluate", fake_call_evaluate)
     monkeypatch.setattr(
         dashboard,
-        "evaluate_with_ollama",
+        "evaluate_with_api",
         lambda **kwargs: {
             "judge_status": "ok",
             "error_message": None,
@@ -256,10 +256,9 @@ def test_run_evaluation_job_updates_state_and_logs(monkeypatch, tmp_path):
         api_base="http://127.0.0.1:9000",
         llm_model_id=None,
         top_k=5,
-        use_ollama_judge=True,
+        use_judge=True,
         retrieval_only=False,
-        ollama_base_url="http://127.0.0.1:11434",
-        ollama_model="gemma4:e4b",
+        judge_config=JudgeConfig("https://judge.example/v1", "test-model", "unit-test-secret"),
         cases=cases,
         corpus_docs=[],
         total_loaded_cases=len(cases),
@@ -348,10 +347,9 @@ def test_run_evaluation_job_records_timeout_and_continues(monkeypatch, tmp_path)
         api_base="http://127.0.0.1:9000",
         llm_model_id=None,
         top_k=5,
-        use_ollama_judge=False,
+        use_judge=False,
         retrieval_only=True,
-        ollama_base_url="http://127.0.0.1:11434",
-        ollama_model="gemma4:e4b",
+        judge_config=JudgeConfig("https://judge.example/v1", "test-model", "unit-test-secret"),
         cases=cases,
         corpus_docs=[],
         total_loaded_cases=len(cases),
@@ -365,3 +363,67 @@ def test_run_evaluation_job_records_timeout_and_continues(monkeypatch, tmp_path)
     assert snapshot["rows"][1]["error_code"] == "request_timeout"
     assert any("timeout case=case-2" in log for log in snapshot["logs"])
     assert snapshot["output_path"] == str(json_report_path)
+
+
+def test_dashboard_key_is_masked_and_environment_key_is_not_in_layout(monkeypatch):
+    monkeypatch.setenv("RAG_JUDGE_API_KEY", "dashboard-env-secret")
+    http = dashboard.app.server.test_client()
+    layout = http.get("/_dash-layout")
+    assert layout.status_code == 200
+    assert b'dashboard-env-secret' not in layout.data
+    def find(node):
+        if isinstance(node, dict):
+            if node.get("props", {}).get("id") == "judge-api-key":
+                return node["props"]
+            for value in node.values():
+                found = find(value)
+                if found:
+                    return found
+        elif isinstance(node, list):
+            for child in node:
+                found = find(child)
+                if found:
+                    return found
+    props = find(layout.json)
+    assert props["type"] == "password"
+    assert props["value"] == ""
+    assert props["persistence"] is False
+    dependencies = http.get("/_dash-dependencies").json
+    assert any(s["id"] == "judge-api-key" for callback in dependencies for s in callback["state"])
+
+
+def test_dashboard_missing_key_blocks_run_before_starting_worker(monkeypatch):
+    monkeypatch.delenv("RAG_JUDGE_API_KEY", raising=False)
+    dashboard._publish_run_error("reset")
+    result = dashboard.start_evaluation(
+        n_clicks=1, api_base="http://localhost:9000", llm_model_id=None, top_k=None,
+        max_questions=None, use_judge_flags=["enabled"], retrieval_only_flags=[],
+        judge_base_url="https://judge.example/v1", judge_model="model",
+        cases=[{"case_id": "one", "question": "Question"}], corpus_docs=None,
+        adapter_kind="generic", judge_api_key="",
+    )
+    assert result["job_id"] is None
+    assert "API key is required" in dashboard._snapshot_run_state()["live_status"]
+
+
+def test_dashboard_passes_key_only_to_worker_and_not_run_state(monkeypatch):
+    captured = {}
+    class Thread:
+        def __init__(self, target, args, daemon):
+            captured["args"] = args
+        def start(self):
+            pass
+    monkeypatch.setattr(dashboard.threading, "Thread", Thread)
+    dashboard._publish_run_error("reset")
+    result = dashboard.start_evaluation(
+        n_clicks=1, api_base="http://localhost:9000", llm_model_id=None, top_k=None,
+        max_questions=None, use_judge_flags=["enabled"], retrieval_only_flags=[],
+        judge_base_url="https://judge.example/v1", judge_model="model",
+        cases=[{"case_id": "one", "question": "Question"}], corpus_docs=None,
+        adapter_kind="generic", judge_api_key="dashboard-input-secret",
+    )
+    assert result["job_id"]
+    config = next(arg for arg in captured["args"] if isinstance(arg, JudgeConfig))
+    assert config.api_key == "dashboard-input-secret"
+    assert "dashboard-input-secret" not in json.dumps(result) + json.dumps(dashboard._snapshot_run_state()) + repr(config)
+    dashboard._publish_run_error("reset")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import json
+import os
 from pathlib import Path
 import re
 import sys
@@ -33,11 +34,13 @@ from common import (
     write_jsonl,
 )
 from judge import (
-    DEFAULT_OLLAMA_BASE_URL,
-    DEFAULT_OLLAMA_MODEL,
+    DEFAULT_JUDGE_BASE_URL,
+    DEFAULT_JUDGE_MODEL,
+    JudgeConfig,
+    make_judge_config,
     api_error_judge_result,
     disabled_judge_result,
-    evaluate_with_ollama,
+    evaluate_with_api,
 )
 from adapters import AdapterProfile, HttpRagAdapter, load_profile
 from runner import iter_evaluations
@@ -195,7 +198,7 @@ body {{
 }}
 
 /* Inputs */
-input[type=text], input[type=number] {{
+input[type=text], input[type=number], input[type=password] {{
     background: {SURFACE_HI} !important;
     border: 1px solid {BORDER} !important;
     border-radius: 8px !important;
@@ -217,7 +220,7 @@ input[type=number]::-webkit-outer-spin-button {{
     appearance: none !important;
     margin: 0 !important;
 }}
-input[type=text]:focus, input[type=number]:focus {{
+input[type=text]:focus, input[type=number]:focus, input[type=password]:focus {{
     border-color: {ACCENT} !important;
     box-shadow: 0 0 0 3px {ACCENT}22 !important;
 }}
@@ -365,7 +368,7 @@ input[type=text]:focus, input[type=number]:focus {{
 /* Checkbox */
 input[type=checkbox] {{ accent-color: {ACCENT} !important; }}
 .dash-checklist label,
-#use-ollama-judge label {{
+#use-api-judge label {{
     color: {TEXT_DIM} !important;
     font-family: {FONT} !important;
     font-size: 12px !important;
@@ -636,9 +639,9 @@ app.layout = html.Div(
                 _field("Max Questions",
                        dcc.Input(id="max-questions", type="number", min=1, step=1,
                                  value=None, placeholder="all", style={"width": "100%"}), width="148px"),
-                _field("Use Ollama Judge",
+                _field("Use API Judge",
                        dcc.Checklist(
-                           id="use-ollama-judge",
+                           id="use-api-judge",
                            options=[{"label": " Enabled", "value": "enabled"}],
                            value=["enabled"],
                            style={"color": TEXT_DIM, "fontSize": "12px", "fontWeight": "500"},
@@ -652,15 +655,23 @@ app.layout = html.Div(
                            style={"color": TEXT_DIM, "fontSize": "12px", "fontWeight": "500"},
                            inputStyle={"accentColor": ACCENT, "marginRight": "6px"},
                        ), width="160px"),
-                _field("Ollama Base URL",
-                       dcc.Input(id="ollama-base-url", type="text",
-                                 value=DEFAULT_OLLAMA_BASE_URL, style={"width": "100%"}), width="250px"),
-                _field("Ollama Model",
-                       dcc.Input(id="ollama-model", type="text",
-                                 value=DEFAULT_OLLAMA_MODEL, style={"width": "100%"}), width="250px"),
+                _field("Judge API Base URL",
+                       dcc.Input(id="judge-base-url", type="text",
+                                 value=os.environ.get("RAG_JUDGE_BASE_URL") or DEFAULT_JUDGE_BASE_URL, style={"width": "100%"}), width="250px"),
+                _field("Judge Model",
+                       dcc.Input(id="judge-model", type="text",
+                                 value=os.environ.get("RAG_JUDGE_MODEL") or DEFAULT_JUDGE_MODEL,
+                                 placeholder="Model ID from your provider", style={"width": "100%"}), width="250px"),
+                _field("Judge API Key",
+                       dcc.Input(id="judge-api-key", type="password", value="",
+                                 placeholder="Or set RAG_JUDGE_API_KEY", autoComplete="off",
+                                 persistence=False, style={"width": "100%"}), width="270px"),
             ],
             style={"display": "flex", "gap": "12px", "marginBottom": "14px", "flexWrap": "wrap"},
         ),
+
+        html.P("API judging sends questions, reference answers, generated answers, and retrieved evidence to your selected provider. The key stays in memory and is excluded from reports.",
+               style={"color": TEXT_MUTED, "fontSize": "12px", "lineHeight": "1.6", "marginBottom": "16px"}),
 
         # ── Actions ──────────────────────────────────────────────────────────
         html.Div([
@@ -1007,16 +1018,17 @@ def on_corpus_upload(contents: str | None, filename: str | None):
     State("android-llm-model", "value"),
     State("top-k", "value"),
     State("max-questions", "value"),
-    State("use-ollama-judge", "value"),
+    State("use-api-judge", "value"),
     State("retrieval-only", "value"),
-    State("ollama-base-url", "value"),
-    State("ollama-model", "value"),
+    State("judge-base-url", "value"),
+    State("judge-model", "value"),
     State("cases-store", "data"),
     State("corpus-store", "data"),
     State("adapter-kind", "value"),
     State("adapter-profile-store", "data"),
     State("external-model-id", "value"),
     State("judge-domain", "value"),
+    State("judge-api-key", "value"),
     prevent_initial_call=True,
 )
 def start_evaluation(
@@ -1025,16 +1037,17 @@ def start_evaluation(
         llm_model_id: str | None,
         top_k: int | None,
         max_questions: int | None,
-        use_ollama_judge_flags: list[str] | None,
+        use_judge_flags: list[str] | None,
         retrieval_only_flags: list[str] | None,
-        ollama_base_url: str | None,
-        ollama_model: str | None,
+        judge_base_url: str | None,
+        judge_model: str | None,
         cases: list[dict[str, Any]] | None,
         corpus_docs: dict[str, Any] | None,
         adapter_kind: str = "brite",
         adapter_profile: dict[str, Any] | None = None,
         external_model_id: str | None = None,
         judge_domain: str | None = None,
+        judge_api_key: str | None = None,
 ):
     if not n_clicks:
         return no_update
@@ -1069,10 +1082,13 @@ def start_evaluation(
 
     job_id = uuid.uuid4().hex[:8]
     retrieval_only = "enabled" in (retrieval_only_flags or [])
-    use_ollama_judge = "enabled" in (use_ollama_judge_flags or [])
-    use_ollama_judge_effective = use_ollama_judge and not retrieval_only
-    ollama_base_url = ollama_base_url or DEFAULT_OLLAMA_BASE_URL
-    ollama_model = ollama_model or DEFAULT_OLLAMA_MODEL
+    use_judge = "enabled" in (use_judge_flags or [])
+    use_judge_effective = use_judge and not retrieval_only
+    try:
+        judge_config = make_judge_config(judge_base_url, judge_model, judge_api_key) if use_judge_effective else None
+    except ValueError as exc:
+        _publish_run_error(str(exc))
+        return {"request_id": n_clicks, "job_id": None}
     _initialize_run_state(
         job_id=job_id,
         total_cases=len(selected_cases),
@@ -1089,7 +1105,7 @@ def start_evaluation(
             f"llm_model_id={llm_model_id} "
             f"selected_cases={len(selected_cases)}/{total_loaded_cases} corpus_file={bool(corpus_docs)} "
             f"retrieval_only={'enabled' if retrieval_only else 'disabled'} "
-            f"ollama_judge={'enabled' if use_ollama_judge_effective else 'disabled'} model={ollama_model}"
+            f"api_judge={'enabled' if use_judge_effective else 'disabled'}"
         ),
     )
 
@@ -1100,10 +1116,9 @@ def start_evaluation(
             api_base,
             llm_model_id,
             top_k,
-            use_ollama_judge_effective,
+            use_judge_effective,
             retrieval_only,
-            ollama_base_url,
-            ollama_model,
+            judge_config,
             selected_cases,
             corpus_docs or {},
             total_loaded_cases,
@@ -1286,23 +1301,21 @@ def show_case_detail(selected_rows: list[dict[str, Any]] | None):
 def _judge_case(
     case: dict[str, Any],
     response: dict[str, Any],
-    use_ollama_judge: bool,
-    ollama_base_url: str,
-    ollama_model: str,
+    use_judge: bool,
+    judge_config: JudgeConfig | None,
     domain: str = "medical first-aid",
 ) -> dict[str, Any]:
     error = (response.get("error") or {}) if isinstance(response, dict) else {}
     if error:
         return api_error_judge_result(error.get("message", "RAG API error."))
-    if not use_ollama_judge:
+    if not use_judge:
         return disabled_judge_result()
-    return evaluate_with_ollama(
+    return evaluate_with_api(
         question=case.get("question", ""),
         ground_truth=case.get("ground_truth_answer", ""),
         generated_answer=response.get("generated_answer", "") or "",
         retrieved_chunks=response.get("retrieved_chunks") or [],
-        ollama_base_url=ollama_base_url,
-        model=ollama_model,
+        config=judge_config or make_judge_config(),
         domain=domain,
     )
 
@@ -1521,10 +1534,9 @@ def _run_evaluation_job(
         api_base: str,
         llm_model_id: str | None,
         top_k: int | None,
-        use_ollama_judge: bool,
+        use_judge: bool,
         retrieval_only: bool,
-        ollama_base_url: str,
-        ollama_model: str,
+        judge_config: JudgeConfig | None,
         cases: list[dict[str, Any]],
         corpus_docs: dict[str, Any] | None,
         total_loaded_cases: int,
@@ -1587,16 +1599,15 @@ def _run_evaluation_job(
             "selected_cases": len(cases),
             "total_loaded_cases": total_loaded_cases,
             "corpus_uploaded": bool(corpus_docs),
-            "ollama_judge_enabled": use_ollama_judge and not retrieval_only,
+            "judge_enabled": use_judge and not retrieval_only,
             "retrieval_only": retrieval_only,
-            "ollama_base_url": ollama_base_url,
-            "ollama_model": ollama_model,
+            **(judge_config.report_metadata() if judge_config else {}),
         }
         _append_run_log(job_id, f"[output] json={json_report_path} jsonl={output_path}")
 
         def judge_case(case, response):
-            return _judge_case(case, response, use_ollama_judge and not retrieval_only,
-                               ollama_base_url, ollama_model,
+            return _judge_case(case, response, use_judge and not retrieval_only,
+                               judge_config,
                                domain=judge_domain or adapter.profile.judge_domain)
 
         runs = iter_evaluations(adapter, cases, judge_case, top_k=top_k,
@@ -1812,4 +1823,4 @@ def _sum_metrics(left: Any, right: Any) -> int | None:
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=8050, debug=True)
+    app.run(host="127.0.0.1", port=8050, debug=False)

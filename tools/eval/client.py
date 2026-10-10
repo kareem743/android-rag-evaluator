@@ -17,11 +17,13 @@ from common import (
     write_jsonl,
 )
 from judge import (
-    DEFAULT_OLLAMA_BASE_URL,
-    DEFAULT_OLLAMA_MODEL,
+    DEFAULT_JUDGE_API_KEY_ENV,
+    DEFAULT_JUDGE_TIMEOUT_SECONDS,
+    JudgeConfig,
+    make_judge_config,
     api_error_judge_result,
     disabled_judge_result,
-    evaluate_with_ollama,
+    evaluate_with_api,
 )
 
 
@@ -74,7 +76,7 @@ def parse_args() -> argparse.Namespace:
         help="Optional max number of cases to run.",
     )
     parser.add_argument(
-        "--no-ollama-judge",
+        "--no-judge",
         action="store_true",
         help="Disable semantic scoring and only store application outputs.",
     )
@@ -83,16 +85,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Request retrieval-only evaluation from an app that supports it.",
     )
-    parser.add_argument(
-        "--ollama-base-url",
-        default=DEFAULT_OLLAMA_BASE_URL,
-        help="Ollama base URL for semantic judging.",
-    )
-    parser.add_argument(
-        "--ollama-model",
-        default=DEFAULT_OLLAMA_MODEL,
-        help="Ollama model for semantic judging.",
-    )
+    parser.add_argument("--judge-api-base", "--judge-base-url", dest="judge_api_base",
+                        help="Judge API base URL; defaults to RAG_JUDGE_BASE_URL or https://api.openai.com/v1.")
+    parser.add_argument("--judge-model", help="Judge model ID; defaults to RAG_JUDGE_MODEL.")
+    parser.add_argument("--judge-api-key-env", default=DEFAULT_JUDGE_API_KEY_ENV,
+                        help="Environment variable containing the judge API key (default: RAG_JUDGE_API_KEY).")
+    parser.add_argument("--judge-timeout", type=float, default=DEFAULT_JUDGE_TIMEOUT_SECONDS,
+                        help="Judge API timeout in seconds.")
     return parser.parse_args()
 
 
@@ -103,6 +102,14 @@ def main() -> int:
         cases = cases[: args.limit]
     if not cases:
         raise SystemExit("No cases were loaded from the dataset.")
+
+    use_judge = not args.no_judge and not args.retrieval_only
+    try:
+        judge_config = make_judge_config(args.judge_api_base, args.judge_model,
+                                        api_key_env=args.judge_api_key_env,
+                                        timeout=args.judge_timeout) if use_judge else None
+    except ValueError as exc:
+        raise SystemExit(f"Judge setup failed: {exc}") from exc
 
     try:
         profile = load_profile(getattr(args, "adapter_profile", None), getattr(args, "adapter", "brite"))
@@ -136,9 +143,8 @@ def main() -> int:
         "api_base": args.api_base,
         "top_k_override": args.top_k,
         "corpus": args.corpus,
-        "ollama_judge_enabled": not args.no_ollama_judge and not args.retrieval_only,
-        "ollama_base_url": args.ollama_base_url,
-        "ollama_model": args.ollama_model,
+        "judge_enabled": use_judge,
+        **(judge_config.report_metadata() if judge_config else {}),
         "llm_model_id": args.llm_model_id,
         "retrieval_only": args.retrieval_only,
     }
@@ -149,9 +155,8 @@ def main() -> int:
     def judge_case(case, api_response):
         return evaluate_case_with_judge(
             case=case, api_response=api_response,
-            use_ollama_judge=(not args.no_ollama_judge) and (not args.retrieval_only),
-            ollama_base_url=args.ollama_base_url,
-            ollama_model=args.ollama_model,
+            use_judge=use_judge,
+            judge_config=judge_config,
             domain=getattr(args, "judge_domain", None) or profile.judge_domain,
         )
 
@@ -195,25 +200,23 @@ def main() -> int:
 def evaluate_case_with_judge(
     case: dict[str, Any],
     api_response: dict[str, Any],
-    use_ollama_judge: bool = True,
-    ollama_base_url: str = DEFAULT_OLLAMA_BASE_URL,
-    ollama_model: str = DEFAULT_OLLAMA_MODEL,
+    use_judge: bool = True,
+    judge_config: JudgeConfig | None = None,
     domain: str = "medical first-aid",
 ) -> dict[str, Any]:
     error = (api_response.get("error") or {}) if isinstance(api_response, dict) else {}
     if error:
         return api_error_judge_result(error.get("message", "RAG API returned an error."))
 
-    if not use_ollama_judge:
+    if not use_judge:
         return disabled_judge_result()
 
-    return evaluate_with_ollama(
+    return evaluate_with_api(
         question=case.get("question", ""),
         ground_truth=case.get("ground_truth_answer", ""),
         generated_answer=(api_response.get("generated_answer") or "").strip(),
         retrieved_chunks=api_response.get("retrieved_chunks") or [],
-        ollama_base_url=ollama_base_url,
-        model=ollama_model,
+        config=judge_config or make_judge_config(),
         domain=domain,
     )
 

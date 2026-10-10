@@ -18,7 +18,7 @@ CASE = {"case_id": "one", "question": "Where is the evidence?", "ground_truth_an
 
 @pytest.fixture
 def alternate_api(monkeypatch):
-    # Exercise the real HTTP transport without depending on a phone or Ollama.
+    # Exercise the real HTTP transport without depending on a phone or a hosted judge.
     monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
     received = []
 
@@ -176,7 +176,7 @@ def test_cli_evaluates_alternate_api_and_writes_reports(alternate_api, tmp_path,
     output = tmp_path / "results.jsonl"
     monkeypatch.setattr(sys, "argv", ["client.py", "--dataset", str(dataset), "--api-base", base,
                                      "--adapter-profile", str(profile_path), "--top-k", "3",
-                                     "--no-ollama-judge", "--output", str(output)])
+                                     "--no-judge", "--output", str(output)])
     assert client.main() == 0
     report = json.loads(output.with_suffix(".json").read_text())
     assert report["metadata"]["adapter"] == "other-android-app"

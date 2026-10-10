@@ -26,6 +26,7 @@ def test_evaluate_case_with_judge_returns_api_error_on_response_error():
 
 
 def test_main_runs_end_to_end(monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("RAG_JUDGE_API_KEY", "unit-test-secret")
     written: dict[str, object] = {}
     args = Namespace(
         dataset="dataset.json",
@@ -36,10 +37,12 @@ def test_main_runs_end_to_end(monkeypatch, capsys, tmp_path):
         llm_model_id=None,
         corpus="corpus.txt",
         limit=1,
-        no_ollama_judge=False,
+        no_judge=False,
         retrieval_only=False,
-        ollama_base_url="http://127.0.0.1:11434",
-        ollama_model="gemma4:e4b",
+        judge_api_base="https://judge.example/v1",
+        judge_model="test-model",
+        judge_api_key_env="RAG_JUDGE_API_KEY",
+        judge_timeout=180,
     )
 
     monkeypatch.setattr(client, "parse_args", lambda: args)
@@ -79,7 +82,7 @@ def test_main_runs_end_to_end(monkeypatch, capsys, tmp_path):
     )
     monkeypatch.setattr(
         client,
-        "evaluate_with_ollama",
+        "evaluate_with_api",
         lambda **kwargs: {
             "judge_status": "ok",
             "error_message": None,
@@ -144,3 +147,17 @@ def test_main_runs_end_to_end(monkeypatch, capsys, tmp_path):
     assert "[health] status=ok runtime_ready=True" in stdout
     assert "[upload] rag_id=rag-1 name=Guide node_count=7" in stdout
     assert "[done] saved_json=" in stdout
+
+
+def test_missing_judge_key_fails_before_contacting_app(monkeypatch, tmp_path):
+    import json
+    import pytest
+    dataset = tmp_path / "cases.json"
+    dataset.write_text(json.dumps([{"case_id": "one", "question": "Question"}]))
+    monkeypatch.delenv("RAG_JUDGE_API_KEY", raising=False)
+    monkeypatch.setattr("sys.argv", ["client.py", "--dataset", str(dataset), "--judge-model", "model"])
+    def unexpected_call(*args, **kwargs):
+        pytest.fail("RAG app must not be contacted before judge configuration is valid")
+    monkeypatch.setattr(client, "call_health", unexpected_call)
+    with pytest.raises(SystemExit, match="API key is required"):
+        client.main()

@@ -3,14 +3,19 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
+from dataclasses import dataclass, field
+from ipaddress import ip_address
+from urllib.parse import urlsplit
 from typing import Any
 
-import ollama
+import requests
 
 
-DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
-DEFAULT_OLLAMA_MODEL = "gemma4:e4b"
-DEFAULT_OLLAMA_TIMEOUT_SECONDS = 180
+DEFAULT_JUDGE_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_JUDGE_MODEL = ""
+DEFAULT_JUDGE_API_KEY_ENV = "RAG_JUDGE_API_KEY"
+DEFAULT_JUDGE_TIMEOUT_SECONDS = 180
 
 RETRIEVAL_EVAL_K = 5
 SEMANTIC_PASS_THRESHOLD = 0.75
@@ -27,74 +32,121 @@ LOGGER.setLevel(logging.INFO)
 LOGGER.propagate = False
 
 
-def evaluate_with_ollama(
+@dataclass(frozen=True)
+class JudgeConfig:
+    """API configuration; the key is deliberately excluded from repr and reports."""
+
+    base_url: str
+    model: str
+    api_key: str = field(repr=False)
+    timeout: float = DEFAULT_JUDGE_TIMEOUT_SECONDS
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "base_url", self.base_url.strip().rstrip("/"))
+        object.__setattr__(self, "model", self.model.strip())
+        object.__setattr__(self, "api_key", self.api_key.strip())
+        if not self.model:
+            raise ValueError("Judge model is required. Set --judge-model or RAG_JUDGE_MODEL.")
+        if not self.api_key:
+            raise ValueError("Judge API key is required. Set RAG_JUDGE_API_KEY or enter it in the local dashboard.")
+        if "\r" in self.api_key or "\n" in self.api_key:
+            raise ValueError("Judge API key must be a single line.")
+        parsed = urlsplit(self.base_url)
+        try:
+            loopback = parsed.hostname == "localhost" or ip_address(parsed.hostname or "").is_loopback
+        except ValueError:
+            loopback = False
+        if (not parsed.hostname or parsed.scheme not in {"https", "http"}
+                or (parsed.scheme == "http" and not loopback)):
+            raise ValueError("Judge API URL must use HTTPS (HTTP is allowed only on loopback).")
+        if parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
+            raise ValueError("Judge API URL cannot contain credentials, query parameters, or a fragment.")
+        if not math.isfinite(self.timeout) or self.timeout <= 0:
+            raise ValueError("Judge timeout must be a positive finite number.")
+
+    @property
+    def endpoint(self) -> str:
+        if self.base_url.endswith("/chat/completions"):
+            return self.base_url
+        return self.base_url + "/chat/completions"
+
+    def report_metadata(self) -> dict[str, Any]:
+        return {"judge_api_base": self.base_url, "judge_model": self.model,
+                "judge_protocol": "openai-chat-completions"}
+
+
+def make_judge_config(
+        base_url: str | None = None,
+        model: str | None = None,
+        api_key: str | None = None,
+        api_key_env: str = DEFAULT_JUDGE_API_KEY_ENV,
+        timeout: float = DEFAULT_JUDGE_TIMEOUT_SECONDS,
+) -> JudgeConfig:
+    return JudgeConfig(
+        base_url=base_url or os.environ.get("RAG_JUDGE_BASE_URL") or DEFAULT_JUDGE_BASE_URL,
+        model=model or os.environ.get("RAG_JUDGE_MODEL") or DEFAULT_JUDGE_MODEL,
+        api_key=api_key or os.environ.get(api_key_env) or "",
+        timeout=timeout,
+    )
+
+
+def evaluate_with_api(
         question: str,
         ground_truth: str,
         generated_answer: str,
         retrieved_chunks: list[dict],
-        ollama_base_url: str = DEFAULT_OLLAMA_BASE_URL,
-        model: str = DEFAULT_OLLAMA_MODEL,
-        domain: str = "medical first-aid",
+        config: JudgeConfig,
+        domain: str = "general",
 ) -> dict[str, Any]:
+    """Judge through any compatible Chat Completions endpoint with Bearer auth."""
     prompt = _build_judge_prompt(question, ground_truth, generated_answer, retrieved_chunks, domain=domain)
-
-    LOGGER.info(
-        "Sending semantic judge request to Ollama: model=%s host=%s question_chars=%d answer_chars=%d chunks=%d prompt_chars=%d",
-        model,
-        ollama_base_url,
-        len(question or ""),
-        len(generated_answer or ""),
-        len(retrieved_chunks or []),
-        len(prompt),
-    )
-
+    LOGGER.info("Sending semantic judge API request: question_chars=%d answer_chars=%d chunks=%d",
+                len(question or ""), len(generated_answer or ""), len(retrieved_chunks or []))
     try:
-        client = ollama.Client(
-            host=ollama_base_url.rstrip("/"),
-            timeout=DEFAULT_OLLAMA_TIMEOUT_SECONDS,
+        response = requests.post(
+            config.endpoint,
+            headers={"Authorization": f"Bearer {config.api_key}", "Content-Type": "application/json"},
+            json={"model": config.model, "messages": [{"role": "user", "content": prompt}], "stream": False},
+            timeout=config.timeout,
+            allow_redirects=False,
         )
+    except requests.exceptions.Timeout:
+        return judge_error("Judge API request timed out.")
+    except requests.exceptions.RequestException:
+        # Provider bodies and exception strings may contain the Authorization header.
+        return judge_error("Judge API network request failed. Check the API URL and connection.")
 
-        response = client.generate(
-            model=model,
-            prompt=prompt,
-            stream=False,
-            format="json",
-            options={"temperature": 0},
-        )
+    if response.status_code != 200:
+        return judge_error(f"Judge API request failed (HTTP {response.status_code}). Check the API key, model, URL, and provider quota.")
+    try:
+        body = response.json()
+        raw_text = _extract_chat_text(body)
+    except (ValueError, TypeError, KeyError, IndexError):
+        return judge_error("Judge API response did not contain Chat Completions message text.")
 
-    except ollama.ResponseError as exc:
-        LOGGER.exception("Ollama semantic judge request failed with Ollama response error")
-        status_code = getattr(exc, "status_code", None)
-        error_message = getattr(exc, "error", None) or str(exc)
-        return judge_error(f"Ollama request failed: status={status_code} error={error_message}")
-
-    except Exception as exc:  # noqa: BLE001
-        LOGGER.exception("Ollama semantic judge request failed")
-        return judge_error(f"Ollama request failed: {exc}")
-
-    body = _ollama_response_to_dict(response)
-
-    if isinstance(body, dict) and _looks_like_judge_json(body):
-        result = normalize_ollama_judge_response(body)
-        _log_judge_result(result)
-        return result
-
-    raw_text = _extract_ollama_text(body)
-    LOGGER.info("Received Ollama semantic judge response: response_chars=%d", len(raw_text or ""))
-
+    # Do not persist a key even if a provider unexpectedly echoes it in its output.
+    raw_text = raw_text.replace(config.api_key, "[REDACTED]")
     parsed = extract_first_json_object(raw_text)
     if parsed.get("judge_status") == "error":
-        LOGGER.error("Ollama semantic judge JSON parse failed: %s", parsed.get("error_message"))
+        _log_judge_result(parsed)
         return parsed
-
-    result = normalize_ollama_judge_response(parsed)
+    result = normalize_judge_response(parsed)
     _log_judge_result(result)
     return result
 
 
+def _extract_chat_text(body: Any) -> str:
+    content = body["choices"][0]["message"]["content"]
+    if isinstance(content, list):
+        content = "".join(item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text")
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("No message text")
+    return content
+
+
 def extract_first_json_object(text: str) -> dict[str, Any]:
     if not isinstance(text, str):
-        return judge_error("Expected a string while parsing Ollama JSON output.")
+        return judge_error("Expected a string while parsing API judge JSON output.")
 
     stripped = text.strip()
     try:
@@ -145,22 +197,22 @@ def extract_first_json_object(text: str) -> dict[str, Any]:
                     first_error = exc
                     start = None
 
-    return judge_error(f"Could not parse a balanced JSON object from Ollama output: {first_error}", raw_response=text)
+    return judge_error(f"Could not parse a balanced JSON object from API judge output: {first_error}", raw_response=text)
 
 
-def normalize_ollama_judge_response(judge_json: dict[str, Any]) -> dict[str, Any]:
+def normalize_judge_response(judge_json: dict[str, Any]) -> dict[str, Any]:
     retrieval = judge_json.get("retrieval")
     answer = judge_json.get("answer")
     if not isinstance(retrieval, dict) or not isinstance(answer, dict):
-        return judge_error("Ollama judge JSON is missing retrieval or answer objects.", raw_response=judge_json)
+        return judge_error("Judge JSON is missing retrieval or answer objects.", raw_response=judge_json)
 
     chunk_relevance_raw = retrieval.get("chunk_relevance")
     if not isinstance(chunk_relevance_raw, list):
-        return judge_error("Ollama judge JSON is missing retrieval.chunk_relevance labels.", raw_response=judge_json)
+        return judge_error("Judge JSON is missing retrieval.chunk_relevance labels.", raw_response=judge_json)
 
     answer_score = _optional_float(answer.get("score"))
     if answer_score is None:
-        return judge_error("Ollama judge JSON is missing numeric answer.score.", raw_response=judge_json)
+        return judge_error("Judge JSON is missing numeric answer.score.", raw_response=judge_json)
 
     chunk_relevance = _normalize_chunk_relevance(chunk_relevance_raw)
     distractor_chunks = _normalize_distractors(retrieval.get("distractor_chunks"))
@@ -374,52 +426,6 @@ def _format_chunk_for_prompt(chunk: dict[str, Any], rank: int) -> dict[str, Any]
         "score": chunk.get("score") if isinstance(chunk, dict) else None,
         "snippet": _truncate(_chunk_text(chunk), 2400),
     }
-
-
-def _ollama_response_to_dict(response: Any) -> dict[str, Any]:
-    if isinstance(response, dict):
-        return response
-
-    model_dump = getattr(response, "model_dump", None)
-    if callable(model_dump):
-        dumped = model_dump()
-        if isinstance(dumped, dict):
-            return dumped
-
-    if hasattr(response, "__dict__"):
-        return dict(response.__dict__)
-
-    return {"response": str(response)}
-
-
-def _extract_ollama_text(body: Any) -> str:
-    if isinstance(body, str):
-        return body
-
-    if not isinstance(body, dict):
-        response_attr = getattr(body, "response", None)
-        if isinstance(response_attr, str):
-            return response_attr
-
-        message_attr = getattr(body, "message", None)
-        if isinstance(message_attr, dict) and isinstance(message_attr.get("content"), str):
-            return message_attr["content"]
-
-        return json.dumps(_ollama_response_to_dict(body), ensure_ascii=False)
-
-    response = body.get("response")
-    if isinstance(response, str):
-        return response
-
-    message = body.get("message")
-    if isinstance(message, dict) and isinstance(message.get("content"), str):
-        return message["content"]
-
-    return json.dumps(body, ensure_ascii=False)
-
-
-def _looks_like_judge_json(value: dict[str, Any]) -> bool:
-    return isinstance(value.get("retrieval"), dict) and isinstance(value.get("answer"), dict)
 
 
 def _normalize_chunk_relevance(items: list[Any]) -> list[dict[str, Any]]:
