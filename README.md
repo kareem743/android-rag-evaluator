@@ -5,7 +5,7 @@
 A Python evaluation toolkit for RAG apps running on an Android phone, an emulator, or an HTTP server. Run test questions against your application, optionally score the results with a model API, and explore the exported reports in RAG Evaluation Studio.
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](tools/eval/README.md)
-[![Android](https://img.shields.io/badge/Android-Phone%20%26%20Emulator-3DDC84?logo=android&logoColor=white)](#connect-your-app)
+[![Android](https://img.shields.io/badge/Android-Phone%20%26%20Emulator-3DDC84?logo=android&logoColor=white)](#quick-start)
 [![Open RAG Evaluation Studio](https://img.shields.io/badge/Cloudflare-Open%20RAG%20Evaluation%20Studio-F38020?logo=cloudflare&logoColor=white)](https://rag-evaluation-studio.kareem-rag-tools.workers.dev/)
 
 **[🌐 Open the Cloudflare website](https://rag-evaluation-studio.kareem-rag-tools.workers.dev/)** · **[📖 Full setup guide](tools/eval/README.md)** · **[⚙️ Example app profile](tools/eval/profiles/other_android.example.json)**
