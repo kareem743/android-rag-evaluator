@@ -52,27 +52,63 @@ On macOS or Linux, activate the environment with `source .venv/bin/activate`. If
 
 ### 2. Connect your app
 
-### Install ADB on Windows
+#### Find ADB on Windows
 
-Download **SDK Platform-Tools for Windows** from the [official Android download page](https://developer.android.com/tools/releases/platform-tools). Extract the ZIP and place the extracted folder at `C:\Android\platform-tools`. Confirm that `C:\Android\platform-tools\adb.exe` exists.
+If you use Android Studio, open **Tools → SDK Manager** and note the **Android SDK Location**. Its `platform-tools` folder should contain `adb.exe`. Install **Android SDK Platform-Tools** under **SDK Tools** if it is missing.
 
-Open **PowerShell** in your evaluator repository folder and run:
+The usual location is `%LOCALAPPDATA%\Android\Sdk\platform-tools`. `C:\Android\platform-tools` is only a possible manual download location. Adding a folder to PATH does not install ADB or check whether it exists.
 
-```powershell
-$env:Path = "C:\Android\platform-tools;" + $env:Path
-adb version
-```
-
-The version command must print an Android Debug Bridge version before you continue. The Path change applies to this PowerShell window; use the same window for the ADB commands below, or repeat the first line in each new window. For a permanent setup, add the folder containing `adb.exe` to your Windows user **Path** and reopen the terminal.
-
-If you already have Android Studio, install **Android SDK Platform-Tools** under **Tools → SDK Manager → SDK Tools** and check the SDK location shown there. For the usual Windows SDK location, use this instead:
+**PowerShell** (your prompt starts with `PS`): paste this complete block to check both common locations:
 
 ```powershell
-$env:Path = "$env:LOCALAPPDATA\Android\Sdk\platform-tools;" + $env:Path
-adb version
+$adbDirs = @(
+    "$env:LOCALAPPDATA\Android\Sdk\platform-tools",
+    "C:\Android\platform-tools"
+)
+$adbDir = $adbDirs | Where-Object {
+    Test-Path (Join-Path $_ "adb.exe")
+} | Select-Object -First 1
+
+if ($adbDir) {
+    $env:Path = "$adbDir;$env:Path"
+    adb version
+} else {
+    Write-Host "ADB not found. Check the Android SDK Location in Android Studio > Tools > SDK Manager."
+}
 ```
 
-If your SDK is elsewhere, use its actual `platform-tools` folder.
+If ADB is not found, use the SDK location shown in SDK Manager and append `\platform-tools`. Replace this example with your actual folder:
+
+```powershell
+$adbDir = "D:\YourActualSdkFolder\platform-tools"
+Test-Path "$adbDir\adb.exe"
+```
+
+Continue only if the check prints **True**:
+
+```powershell
+& "$adbDir\adb.exe" version
+$env:Path = "$adbDir;$env:Path"
+```
+
+**Command Prompt (CMD)** (a `C:\...>` prompt without `PS`): use this instead:
+
+```cmd
+set "ADB_DIR=%LOCALAPPDATA%\Android\Sdk\platform-tools"
+if not exist "%ADB_DIR%\adb.exe" set "ADB_DIR=C:\Android\platform-tools"
+if exist "%ADB_DIR%\adb.exe" (
+    set "PATH=%ADB_DIR%;%PATH%"
+    adb version
+) else (
+    echo ADB not found. Check the Android SDK Location in SDK Manager.
+)
+```
+
+For a custom SDK, set `ADB_DIR` to its actual `platform-tools` folder.
+
+If you do not have Android Studio, download **SDK Platform-Tools for Windows** from the [official Android download page](https://developer.android.com/tools/releases/platform-tools), extract it, and verify where `adb.exe` was placed. You can choose `C:\Android\platform-tools` and then run the matching block above.
+
+`adb version` must print a version before you continue. The PATH change applies to the current terminal window. For a permanent setup, add the verified folder containing `adb.exe` to your Windows user **Path** and reopen the terminal.
 
 For a phone or emulator, launch the app's debug build and forward its API port:
 
