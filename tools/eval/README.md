@@ -25,6 +25,28 @@ contains only the evaluator: supply your own application, corpus, and test datas
 
 ## Connect your application
 
+### Install ADB on Windows
+
+Download **SDK Platform-Tools for Windows** from the [official Android download page](https://developer.android.com/tools/releases/platform-tools). Extract the ZIP and place the extracted folder at `C:\Android\platform-tools`. Confirm that `C:\Android\platform-tools\adb.exe` exists.
+
+Open **PowerShell** in your evaluator repository folder and run:
+
+```powershell
+$env:Path = "C:\Android\platform-tools;" + $env:Path
+adb version
+```
+
+The version command must print an Android Debug Bridge version before you continue. The Path change applies to this PowerShell window; use the same window for the ADB commands below, or repeat the first line in each new window. For a permanent setup, add the folder containing `adb.exe` to your Windows user **Path** and reopen the terminal.
+
+If you already have Android Studio, install **Android SDK Platform-Tools** under **Tools → SDK Manager → SDK Tools** and check the SDK location shown there. For the usual Windows SDK location, use this instead:
+
+```powershell
+$env:Path = "$env:LOCALAPPDATA\Android\Sdk\platform-tools;" + $env:Path
+adb version
+```
+
+If your SDK is elsewhere, use its actual `platform-tools` folder.
+
 For an Android phone, enable USB debugging and launch the app's debug build.
 For an emulator, start a virtual device in Android Studio and launch the same
 app. Its debug API must already be implemented by the app.
